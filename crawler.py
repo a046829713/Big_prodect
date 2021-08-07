@@ -20,6 +20,7 @@ import zipfile # 解壓縮 # zipfile.Zipfile
 import shutil # 目錄操作
 import time
 import datetime
+import lxml
 
 # 爬蟲專用隨機環境
 def generate_random_header():
@@ -303,6 +304,7 @@ def find_best_session():
         try:
             print('獲取新的Session 第', i, '回合')
             headers = generate_random_header()# 取得header 並且開始正式爬蟲
+            # 讓我們在這一次request 當作同一次
             ses = requests.Session()# session会保存会话，往下发送请求，直接使用session即可
             # 取得Response(200)
             ses.get('https://www.twse.com.tw/zh/', headers=headers, timeout=10)
@@ -310,6 +312,7 @@ def find_best_session():
             ses.headers.update(headers)
             print('成功！')
             return ses # 若成功就不會輸出錯誤訊息
+            # 若出現連結超時 或讀取超時 輸出error
         except (ConnectionError, ReadTimeout) as error:
             print(error)
             print('失敗，10秒後重試')
@@ -447,7 +450,8 @@ def crawl_monthly_report(date):
         # 這將使您的應用程序容易受到中間人 (MitM) 攻擊。將 verify 設置為False在本地開發或測試期間可能很有用。
         
         # r = requests_get(url, headers=headers, verify=False)
-        r = requests_get(url, verify=False)
+        # r = requests_get(url, verify=False)
+        r = requests_get(url)
         r.encoding = 'big5'
         
         
@@ -455,7 +459,7 @@ def crawl_monthly_report(date):
         print('**WARRN: requests cannot get html')
         return None
     
-    import lxml
+    
     
     try:
         # 使用try 避免爬取不到報錯
@@ -487,7 +491,7 @@ def crawl_monthly_report(date):
     df['當月營收'] = pd.to_numeric(df['當月營收'], 'coerce')
     df = df[~df['當月營收'].isnull()]# ~非的意思保留非空直
     df = df[df['公司代號'] != '合計']# 刪除最下面兩行
-    # 計算下個月
+    # 計算下個月 將時間固定在10號 注意會這樣設計是因為 爬取月份 是當月爬下月(現在是1月15日 爬取的有效性為到下月10)
     next_month = datetime.date(date.year + int(date.month / 12), ((date.month % 12) + 1), 10)
     
     df['date'] = pd.to_datetime(next_month)
@@ -623,6 +627,48 @@ def crawl_finance_statement_by_date(date):
     return {}
 
 
+# 讀取大盤指數
+def TWSE_index_data(date):
+    datestr = [date_out.strftime('%Y%m%d') for date_out in date]
+    
+    # freq 月份頻率
+    # month_list = pd.date_range(start_date, end_date, freq="MS").strftime("%Y%m%d").tolist()
+    month_list = datestr
+    index_df = pd.DataFrame()
+    ex_df = pd.DataFrame()
+    for month in month_list:
+        # 大盤指數
+        # https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date=20210601
+        url = "https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date=" + month
+        res = requests_get(url)
+        stock_json = res.json()
+        
+        # print(type(stock_json))
+        stock_df = pd.DataFrame.from_dict(stock_json["data"])
+        index_df = index_df.append(stock_df, ignore_index=True)
+        # 成交量
+        # https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date=20210601
+        url2 = "https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date="+ month
+        res2 = requests_get(url2)
+        
+        exchange_json = res2.json()
+        exchange_df = pd.DataFrame.from_dict(exchange_json["data"])
+        ex_df = ex_df.append(exchange_df, ignore_index=True)
+        time.sleep(random.randint(15, 20))
+        
+    # # ignore_index 自動產生新的index
+    df = pd.concat([index_df, ex_df], axis=1, ignore_index=True)
+    df = df.drop([5,9], axis=1)
+    df.columns = ['date', '開盤價', '最高價', '最低價', '收盤價', '成交股數', '成交金額', '成交筆數', '漲跌點數']
+    d = df["date"]
+    for i in range(len(df)):
+        # 將民國轉成西元
+        d.iloc[i]=d.iloc[i].replace(d.iloc[i][0:3], str(int(d.iloc[i][0:3]) + 1911))
+    df['date'] = pd.to_datetime(d,format='%Y/%m/%d')
+    df = df.set_index("date")
+    
+    
+    return df
 
 # 讀取時間range
 from datetime import date
@@ -668,29 +714,49 @@ def table_exist(conn, table):
         # sqlite3 內建有一個系統資訊 sqlite_master 只允許讀取(使用者) 若有 [(1,)] 回傳格式
         "select count(*) from sqlite_master where type='table' and name='" + table + "'"))[0][0] == 1
     
-# def table_latest_date(conn, table):
-#     cursor = conn.execute('SELECT date FROM ' + table + ' ORDER BY date DESC LIMIT 1;')
-#     return datetime.datetime.strptime(list(cursor)[0][0], '%Y-%m-%d %H:%M:%S') 
+def table_latest_date(conn, table):
+    exist = table_exist(conn, table)
+    if exist :
+    # 將資料庫裡面的最後一天輸出 大到小排序 輸出一個值
+        try:
+            cursor = conn.execute('SELECT date FROM ' + table + ' ORDER BY date DESC LIMIT 1;')
+            return datetime.datetime.strptime(list(cursor)[0][0], '%Y-%m-%d %H:%M:%S')
+        except:
+            print("dont find any date") 
 
-# def table_earliest_date(conn, table):
-#     cursor = conn.execute('SELECT date FROM ' + table + ' ORDER BY date ASC LIMIT 1;')
-#     return datetime.datetime.strptime(list(cursor)[0][0], '%Y-%m-%d %H:%M:%S') 
+def table_earliest_date(conn, table):
+    exist = table_exist(conn, table)
+    if exist :
+        try:
+        # 將資料庫裡面的最後一天輸出 小到大排序 輸出一個值
+            cursor = conn.execute('SELECT date FROM ' + table + ' ORDER BY date ASC LIMIT 1;')
+            return datetime.datetime.strptime(list(cursor)[0][0], '%Y-%m-%d %H:%M:%S')
+        except:
+            print("dont find any date")
+
 # conn 資料庫 name=table name df 爬取到的資料
 def add_to_sql(conn, name, df):
-    
     # 檢查是否存在
     exist = table_exist(conn, name)
+
     # 讀取sql ("seclet 句子" , 資料庫 ,設定index) 若不存在 回傳空值
-    ret = pd.read_sql('select * from ' + name, conn, index_col=['stock_id', 'date']) if exist else pd.DataFrame()
-    
-    # 新增資料
-    ret = ret.append(df)
+    ret = pd.read_sql('select * from ' + name, conn, index_col=['stock_id', 'date']) if exist else pd.DataFrame() 
+    # pandas1.30.0 請勿亂更新版本 否則會出現錯誤 (update 2021.08.05)
+    # =======================================
+    # 先將df 處理完
+    df.reset_index(inplace=True)
+    df['stock_id'] = df['stock_id'].astype(str)
+    df["date"] = pd.to_datetime(df["date"])
+
+    # =======================================
     # 將放入資料庫的index 重設 # 注意index 也會重置
     ret.reset_index(inplace=True)
     # 確保為 字串
     ret['stock_id'] = ret['stock_id'].astype(str)
     # 確保為 時間
     ret['date'] = pd.to_datetime(ret['date'])
+    # 新增資料
+    ret = ret.append(df)
     # 要刪除重複項並保留最後一次出現，請使用keep. 兩個都要相同才會被刪掉
     ret = ret.drop_duplicates(['stock_id', 'date'], keep='last')
     # 將序列排序 由小到大 並設定新的index
@@ -727,7 +793,8 @@ def update_table(conn, table_name, crawl_function, dates):
     
     for d in progress:
         # 陣列顯示時間
-        print('crawling', d)
+        # 減少顯示資訊
+        # print('crawling', d)
         progress.set_description('crawl' + table_name + str(d))
         
         data = crawl_function(d)
@@ -772,3 +839,34 @@ def update_table(conn, table_name, crawl_function, dates):
 
 
 # ========================================================================================================
+# conn 資料庫 name =table name 
+def TWSE_to_sql(name,conn, df):
+        # 檢查是否存在
+    exist = table_exist(conn, name)
+    # 讀取sql ("seclet 句子" , 資料庫 ,設定index) 若不存在 回傳空值, index_col=['date']
+    ret = pd.read_sql('select * from ' + name, conn,index_col=['date']) if exist else pd.DataFrame()
+    ret =ret.append(df)
+    ret = ret.reset_index()
+    ret = ret.dropna()
+    # 確保為 時間
+    ret['date'] = pd.to_datetime(ret['date'])
+        
+    # 要刪除重複項並保留最後一次出現，請使用keep. 兩個都要相同才會被刪掉
+    ret = ret.drop_duplicates(['date'], keep='last')
+
+    # 將序列排序 由小到大 並設定新的index
+    ret = ret.sort_values(['date']).set_index(['date'])
+
+    # 如須備份請開啟
+    #============================
+    # add the combined table
+    ret.to_csv('index_backup.csv')
+    #============================
+    
+    try:
+        # 會刪除原本有的
+        ret.to_sql(name, conn, if_exists='replace')
+    except:
+        ret = pd.read_csv('index_backup.csv', parse_dates=['date'])
+        ret.set_index(['date'], inplace=True)
+        ret.to_sql(name, conn, if_exists='replace')
